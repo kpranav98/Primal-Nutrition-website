@@ -25,6 +25,8 @@ export default function CartDrawer() {
   const [errors, setErrors] = useState({})
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState(null)
+  const [notice, setNotice] = useState(null)   // calm, non-error message (e.g. payment window closed)
+  const [procStep, setProcStep] = useState(0)  // advances the "Processing…" label so it never looks frozen
   const [confirmedOrder, setConfirmedOrder] = useState(null)
   const [paymentMethod, setPaymentMethod] = useState('online')  // 'online' | 'cod'
   const saved = compareSubtotal - subtotal
@@ -42,9 +44,19 @@ export default function CartDrawer() {
     if (!isOpen) {
       setStep('cart')
       setSubmitError(null)
+      setNotice(null)
       setErrors({})
     }
   }, [isOpen])
+
+  // While submitting, advance a status step every 2.2s so the button shows live
+  // progress ("Placing your order…" → "Booking courier…") instead of a static,
+  // frozen-looking "Processing…" — important on slow mobile + COD's courier call.
+  useEffect(() => {
+    if (!submitting) { setProcStep(0); return }
+    const id = setInterval(() => setProcStep((s) => s + 1), 2200)
+    return () => clearInterval(id)
+  }, [submitting])
 
   // Close on escape
   useEffect(() => {
@@ -73,6 +85,7 @@ export default function CartDrawer() {
 
   const handlePay = async () => {
     setSubmitError(null)
+    setNotice(null)
     if (!validate()) return
     setSubmitting(true)
 
@@ -86,8 +99,9 @@ export default function CartDrawer() {
 
     try {
       if (paymentMethod === 'cod') {
-        // COD — server creates order + Shiprocket shipment in one call, no Razorpay.
-        const cod = await api.post('/api/checkout/create-cod-order', { customer, address, items })
+        // COD — server creates order + Shiprocket shipment (several courier API
+        // calls) in one request, so allow more time before aborting.
+        const cod = await api.post('/api/checkout/create-cod-order', { customer, address, items }, { timeout: 45000 })
         setConfirmedOrder({ orderNumber: cod.orderNumber, total: cod.total, method: 'cod' })
         setStep('success')
         clearCart()
@@ -101,35 +115,65 @@ export default function CartDrawer() {
       // Online — Razorpay flow.
       const draft = await api.post('/api/checkout/create-order', { customer, address, items })
 
-      const rzp = await openRazorpayCheckout({
-        keyId: draft.keyId,
-        orderId: draft.razorpayOrderId,
-        amount: draft.amount,
-        currency: draft.currency,
-        description: `Order ${draft.orderNumber}`,
-        prefill: { name: form.name, email: form.email, contact: form.phone },
-      })
+      let rzp
+      try {
+        rzp = await openRazorpayCheckout({
+          keyId: draft.keyId,
+          orderId: draft.razorpayOrderId,
+          amount: draft.amount,
+          currency: draft.currency,
+          description: `Order ${draft.orderNumber}`,
+          prefill: { name: form.name, email: form.email, contact: form.phone },
+        })
+      } catch (err) {
+        // User dismissed the payment window — not an error. Keep their details
+        // and invite them back instead of flashing a scary red banner.
+        if (err.cancelled) {
+          setNotice('Payment window closed — your details are saved. Tap “Pay” whenever you’re ready.')
+          return
+        }
+        throw err
+      }
 
-      await api.post('/api/checkout/verify-payment', {
-        razorpayOrderId: rzp.orderId,
-        razorpayPaymentId: rzp.paymentId,
-        razorpaySignature: rzp.signature,
-        internalOrderId: draft.internalOrderId,
-      })
+      // ── Payment is now CAPTURED by Razorpay. Past this point we must never
+      //    tell the customer to "try again" — that risks a double charge. ──
+      try {
+        await api.post('/api/checkout/verify-payment', {
+          razorpayOrderId: rzp.orderId,
+          razorpayPaymentId: rzp.paymentId,
+          razorpaySignature: rzp.signature,
+          internalOrderId: draft.internalOrderId,
+        })
+        setConfirmedOrder({ orderNumber: draft.orderNumber, paymentId: rzp.paymentId, total: draft.amount / 100, method: 'online' })
+      } catch (verifyErr) {
+        // Money was taken but confirmation didn't come back. Show success with a
+        // "we're finalizing" note — do NOT send them back to pay again.
+        setConfirmedOrder({
+          orderNumber: draft.orderNumber,
+          paymentId: rzp.paymentId,
+          total: draft.amount / 100,
+          method: 'online',
+          pendingVerification: true,
+        })
+      }
 
-      setConfirmedOrder({ orderNumber: draft.orderNumber, paymentId: rzp.paymentId, total: draft.amount / 100, method: 'online' })
       setStep('success')
       clearCart()
-      // Meta Pixel — Purchase event
+      // Meta Pixel — Purchase event (payment was captured either way)
       if (typeof window.fbq === 'function') {
         window.fbq('track', 'Purchase', { value: draft.amount / 100, currency: 'INR', content_type: 'product' })
       }
     } catch (err) {
-      setSubmitError(err.message || 'Something went wrong. Please try again.')
+      setSubmitError(friendlyError(err))
     } finally {
       setSubmitting(false)
     }
   }
+
+  const processingSteps = paymentMethod === 'cod'
+    ? ['Placing your order…', 'Booking your courier…', 'Almost there — hang tight…', 'Still working — please don’t close this…']
+    : ['Securing your order…', 'Opening secure payment…', 'Almost there…']
+  const processingLabel = processingSteps[Math.min(procStep, processingSteps.length - 1)]
 
   return (
     <>
@@ -184,9 +228,11 @@ export default function CartDrawer() {
             <div className="font-stencil text-amber mb-3">₹{confirmedOrder?.total.toLocaleString('en-IN')}</div>
             <p className="text-bone/60 text-sm max-w-xs mb-6">
               Order <span className="font-mono text-bone/80">{confirmedOrder?.orderNumber}</span> is confirmed.
-              {confirmedOrder?.method === 'cod'
-                ? ' Pay on delivery in cash. You\'ll get an email and tracking link shortly.'
-                : ' You\'ll get an email shortly. Shipping update follows when it\'s dispatched.'}
+              {confirmedOrder?.pendingVerification
+                ? ' Your payment went through — we\'re finalizing the order now and will email confirmation shortly. Please do not pay again.'
+                : confirmedOrder?.method === 'cod'
+                  ? ' Pay on delivery in cash. You\'ll get an email and tracking link shortly.'
+                  : ' You\'ll get an email shortly. Shipping update follows when it\'s dispatched.'}
             </p>
             <button onClick={closeCart} className="btn-primary text-sm">Done</button>
           </div>
@@ -194,14 +240,18 @@ export default function CartDrawer() {
           <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4">
             <Field label="Full name" value={form.name} onChange={(v) => setField('name', v)} error={errors.name} />
             <div className="grid grid-cols-2 gap-3">
-              <Field label="Email" type="email" value={form.email} onChange={(v) => setField('email', v)} error={errors.email} />
-              <Field label="Phone" value={form.phone} onChange={(v) => setField('phone', v.replace(/\D/g,'').slice(0,10))} error={errors.phone} />
+              <Field label="Email" type="email" inputMode="email" value={form.email} onChange={(v) => setField('email', v)} error={errors.email} />
+              <Field label="Phone" type="tel" inputMode="numeric" value={form.phone} onChange={(v) => {
+                let d = v.replace(/\D/g, '')
+                if (d.length > 10 && d.startsWith('91')) d = d.slice(2)   // drop pasted +91 prefix
+                setField('phone', d.slice(0, 10))
+              }} error={errors.phone} />
             </div>
             <Field label="Address line 1" value={form.line1} onChange={(v) => setField('line1', v)} error={errors.line1} />
             <Field label="Address line 2 (optional)" value={form.line2} onChange={(v) => setField('line2', v)} />
             <div className="grid grid-cols-2 gap-3">
               <Field label="City" value={form.city} onChange={(v) => setField('city', v)} error={errors.city} />
-              <Field label="Pincode" value={form.pincode} onChange={(v) => setField('pincode', v.replace(/\D/g,'').slice(0,6))} error={errors.pincode} />
+              <Field label="Pincode" type="tel" inputMode="numeric" value={form.pincode} onChange={(v) => setField('pincode', v.replace(/\D/g,'').slice(0,6))} error={errors.pincode} />
             </div>
             <div>
               <label className="text-[11px] uppercase tracking-widest text-bone/55 block mb-1">State</label>
@@ -218,6 +268,11 @@ export default function CartDrawer() {
             {submitError && (
               <div className="text-sm text-rust bg-rust/10 border border-rust/30 rounded-lg p-3">
                 {submitError}
+              </div>
+            )}
+            {notice && (
+              <div className="text-sm text-amber bg-amber/10 border border-amber/30 rounded-lg p-3">
+                {notice}
               </div>
             )}
             <footer className="border-t border-bone/10 pt-5 mt-2 space-y-3">
@@ -261,13 +316,21 @@ export default function CartDrawer() {
                 disabled={submitting}
                 className="btn-primary w-full text-base disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                {submitting
-                  ? 'Processing…'
-                  : paymentMethod === 'cod'
-                    ? `Place COD order · ₹${subtotal.toLocaleString('en-IN')}`
-                    : `Pay ₹${subtotal.toLocaleString('en-IN')}`}
-                {!submitting && (
-                  <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z"/></svg>
+                {submitting ? (
+                  <>
+                    <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-90" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.37 0 0 5.37 0 12h4z" />
+                    </svg>
+                    {processingLabel}
+                  </>
+                ) : (
+                  <>
+                    {paymentMethod === 'cod'
+                      ? `Place COD order · ₹${subtotal.toLocaleString('en-IN')}`
+                      : `Pay ₹${subtotal.toLocaleString('en-IN')}`}
+                    <svg className="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path d="M10.293 3.293a1 1 0 011.414 0l6 6a1 1 0 010 1.414l-6 6a1 1 0 01-1.414-1.414L14.586 11H3a1 1 0 110-2h11.586l-4.293-4.293a1 1 0 010-1.414z"/></svg>
+                  </>
                 )}
               </button>
               <button
@@ -358,12 +421,28 @@ export default function CartDrawer() {
   )
 }
 
-function Field({ label, type = 'text', value, onChange, error }) {
+// Turn technical/server errors into copy a customer can act on.
+function friendlyError(err) {
+  const code = err?.payload?.error
+  if (code === 'SHIPMENT_FAILED' || err?.status === 502) {
+    return 'We couldn’t reach our courier just now. Please try again in a moment, or switch to “Pay online”.'
+  }
+  if (err?.status === 503 || code === 'SUPABASE_NOT_CONFIGURED') {
+    return 'Our checkout is briefly unavailable. Please try again in a minute.'
+  }
+  if (err?.code === 'TIMEOUT' || err?.code === 'NETWORK') {
+    return err.message
+  }
+  return err?.message || 'Something went wrong. Please try again.'
+}
+
+function Field({ label, type = 'text', inputMode, value, onChange, error }) {
   return (
     <div>
       <label className="text-[11px] uppercase tracking-widest text-bone/55 block mb-1">{label}</label>
       <input
         type={type}
+        inputMode={inputMode}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="w-full bg-ink border border-bone/15 rounded-lg px-3 py-2.5 text-sm focus:border-amber focus:outline-none"

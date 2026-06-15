@@ -51,7 +51,7 @@ export default function ProductDetail({ productId }) {
 
   const handleAdd = () => {
     setAdding(true)
-    addToCart(product.id, variantId, 1, false)
+    addToCart(product.id, variantId, 1, true)   // open the cart so checkout is one tap away
     setTimeout(() => setAdding(false), 900)
   }
 

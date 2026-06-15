@@ -53,7 +53,13 @@ export async function openRazorpayCheckout({
       prefill,
       theme,
       modal: {
-        ondismiss: () => reject(new Error('Payment cancelled')),
+        ondismiss: () => {
+          // User closed the modal (e.g. to switch card → UPI). Not a failure —
+          // flag it so the UI shows a calm "ready when you are" prompt, not a red error.
+          const err = new Error('Payment cancelled')
+          err.cancelled = true
+          reject(err)
+        },
       },
       handler: (response) => {
         resolve({

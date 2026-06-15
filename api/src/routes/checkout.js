@@ -25,6 +25,7 @@ import {
   markOrderPaid,
   applyShipmentDetails,
   getOrderForShipment,
+  listOrdersAwaitingFulfillment,
 } from '../services/orderService.js'
 import { fireWelcomeEmail, fireOrderConfirmationEmail } from '../services/emailHooks.js'
 
@@ -288,7 +289,7 @@ router.post('/create-cod-order', async (req, res, next) => {
     // user sees "Shiprocket couldn't accept this order" rather than a silent
     // pending state.
     try {
-      await createShipmentForOrder(draft.internalOrderId, { paymentMethod: 'COD' })
+      await createShipmentForOrder(draft.internalOrderId, { paymentMethod: 'COD', deferAwb: true })
     } catch (shipErr) {
       logger.error({ err: shipErr.message, internalOrderId: draft.internalOrderId }, 'COD shipment creation failed')
       return res.status(502).json({
@@ -337,10 +338,14 @@ router.post('/create-cod-order', async (req, res, next) => {
  * Then assigns an AWB + courier so the order actually ships — without this
  * step the order sits as "NEW" in Shiprocket and never moves.
  *
+ * When `deferAwb` is true, the (slow) courier-booking step runs in the
+ * background and the function resolves as soon as the shipment is created — so
+ * the customer isn't left waiting on "Processing…" through two Shiprocket calls.
+ *
  * @param {string} internalOrderId
- * @param {{ paymentMethod?: 'Prepaid' | 'COD' }} opts
+ * @param {{ paymentMethod?: 'Prepaid' | 'COD', deferAwb?: boolean }} opts
  */
-async function createShipmentForOrder(internalOrderId, { paymentMethod = 'Prepaid' } = {}) {
+async function createShipmentForOrder(internalOrderId, { paymentMethod = 'Prepaid', deferAwb = false } = {}) {
   if (!config.shiprocket.email || !config.shiprocket.password) {
     logger.warn('Shiprocket not configured — skipping shipment creation')
     return
@@ -409,7 +414,9 @@ async function createShipmentForOrder(internalOrderId, { paymentMethod = 'Prepai
     return
   }
 
-  try {
+  // Assign AWB so the order actually books a courier and ships. Without this,
+  // the order sits in "NEW" in the Shiprocket dashboard and never moves.
+  const bookCourier = async () => {
     const awbResult = await assignAwb({ shipmentId })
     const awbData = awbResult?.response?.data ?? awbResult?.data ?? awbResult
     await applyShipmentDetails(internalOrderId, {
@@ -419,10 +426,63 @@ async function createShipmentForOrder(internalOrderId, { paymentMethod = 'Prepai
       shippedAt: new Date().toISOString(),
     })
     logger.info({ internalOrderId, awbCode: awbData?.awb_code, courier: awbData?.courier_name }, 'AWB assigned — order is now placed for shipping')
+  }
+
+  if (deferAwb) {
+    // Don't make the customer wait on courier booking — do it in the background.
+    // NOTE: there is no shipment-retry cron, so a failure here leaves the order
+    // created in Shiprocket but un-booked ("NEW") and needs manual assignment.
+    void bookCourier().catch((awbErr) =>
+      logger.error({ err: awbErr.message, internalOrderId, shipmentId }, 'Deferred AWB assignment failed — order is in Shiprocket but not yet booked')
+    )
+    return
+  }
+
+  try {
+    await bookCourier()
   } catch (awbErr) {
     logger.error({ err: awbErr.message, internalOrderId, shipmentId }, 'AWB assignment failed — order is in Shiprocket but not yet booked')
     throw awbErr
   }
+}
+
+/**
+ * Recover orders that should have shipped but have no AWB — e.g. a background
+ * shipment-creation failure (online) or a deferred AWB that never completed.
+ * Safe to run repeatedly: orders that already have a Shiprocket order are NOT
+ * re-created (avoids duplicate shipments) — they're flagged for manual booking.
+ *
+ * Intended to be hit on a schedule via POST /cron/reconcile-shipments.
+ */
+export async function reconcilePendingShipments() {
+  const orders = await listOrdersAwaitingFulfillment()
+  const summary = { checked: orders.length, reconciled: 0, needsManualAwb: 0, failed: 0, details: [] }
+
+  for (const o of orders) {
+    try {
+      if (!o.shiprocket_order_id) {
+        // No shipment at all — safe to create it (this also assigns the AWB).
+        await createShipmentForOrder(o.id, { paymentMethod: o.payment_method === 'cod' ? 'COD' : 'Prepaid' })
+        summary.reconciled++
+        summary.details.push({ orderNumber: o.order_number, action: 'shipment_created' })
+      } else {
+        // Shipment exists but no courier booked. We don't persist the
+        // Shiprocket shipment_id, so re-booking must be done manually.
+        summary.needsManualAwb++
+        summary.details.push({ orderNumber: o.order_number, action: 'needs_manual_awb', shiprocketOrderId: o.shiprocket_order_id })
+      }
+    } catch (err) {
+      summary.failed++
+      summary.details.push({ orderNumber: o.order_number, action: 'failed', error: err.message })
+      logger.error({ err: err.message, orderId: o.id }, 'Shipment reconciliation failed for order')
+    }
+  }
+
+  logger.info(
+    { checked: summary.checked, reconciled: summary.reconciled, needsManualAwb: summary.needsManualAwb, failed: summary.failed },
+    'Shipment reconciliation run complete'
+  )
+  return summary
 }
 
 export default router

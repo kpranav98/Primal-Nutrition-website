@@ -119,7 +119,7 @@ export default function Hero() {
               muted={muted}
               playsInline
               preload="auto"
-              poster="/products/trex-liquid-01.png"
+              poster="/products/trex-liquid-01.webp"
               className="w-full h-full object-cover"
             />
 

@@ -97,10 +97,14 @@ router.get('/:id', async (req, res, next) => {
       supabase
         .from('orders')
         .select(
-          `id, order_number, status, total, payment_method,
+          `id, order_number, status, subtotal, discount, shipping_fee, tax, total, payment_method,
            placed_at, paid_at, shipped_at, delivered_at, cancelled_at,
            awb_code, courier_name,
-           order_items (id)`
+           order_items (
+             id, product_name_snapshot, variant_label_snapshot, qty, unit_price, line_total,
+             product:products (id, slug, name, image),
+             variant:variants (id, label)
+           )`
         )
         .eq('customer_id', id)
         .order('placed_at', { ascending: false }),
@@ -133,21 +137,71 @@ router.get('/:id', async (req, res, next) => {
       created_at: customerRes?.data?.created_at ?? null,
     }
 
-    const orders = (ordersRes.data ?? []).map((o) => ({
-      id: o.id,
-      order_number: o.order_number,
-      status: o.status,
-      total: o.total,
-      payment_method: o.payment_method,
-      placed_at: o.placed_at,
-      paid_at: o.paid_at,
-      shipped_at: o.shipped_at,
-      delivered_at: o.delivered_at,
-      cancelled_at: o.cancelled_at,
-      awb_code: o.awb_code,
-      courier_name: o.courier_name,
-      item_count: Array.isArray(o.order_items) ? o.order_items.length : 0,
-    }))
+    const orders = (ordersRes.data ?? []).map((o) => {
+      const items = (o.order_items ?? []).map((it) => ({
+        id: it.id,
+        product_id: it.product?.id ?? null,
+        product_slug: it.product?.slug ?? null,
+        product_name: it.product_name_snapshot ?? it.product?.name ?? 'Unknown product',
+        product_image: it.product?.image ?? null,
+        variant_id: it.variant?.id ?? null,
+        variant_label: it.variant_label_snapshot ?? it.variant?.label ?? null,
+        qty: Number(it.qty) || 0,
+        unit_price: Number(it.unit_price) || 0,
+        line_total: Number(it.line_total) || 0,
+      }))
+      const item_qty = items.reduce((sum, it) => sum + it.qty, 0)
+      return {
+        id: o.id,
+        order_number: o.order_number,
+        status: o.status,
+        subtotal: Number(o.subtotal) || 0,
+        discount: Number(o.discount) || 0,
+        shipping_fee: Number(o.shipping_fee) || 0,
+        tax: Number(o.tax) || 0,
+        total: Number(o.total) || 0,
+        payment_method: o.payment_method,
+        placed_at: o.placed_at,
+        paid_at: o.paid_at,
+        shipped_at: o.shipped_at,
+        delivered_at: o.delivered_at,
+        cancelled_at: o.cancelled_at,
+        awb_code: o.awb_code,
+        courier_name: o.courier_name,
+        item_count: items.length,
+        item_qty,
+        items,
+      }
+    })
+
+    // Lifetime per-product breakdown (excludes cancelled orders).
+    const productMap = new Map()
+    for (const o of orders) {
+      if (o.status === 'cancelled') continue
+      for (const it of o.items) {
+        const key = it.product_id ?? it.product_name
+        const prev = productMap.get(key) ?? {
+          product_id: it.product_id,
+          product_slug: it.product_slug,
+          product_name: it.product_name,
+          product_image: it.product_image,
+          total_qty: 0,
+          total_spent: 0,
+          order_count: 0,
+          last_purchased_at: null,
+        }
+        prev.total_qty += it.qty
+        prev.total_spent += it.line_total
+        prev.order_count += 1
+        if (!prev.last_purchased_at || (o.placed_at && o.placed_at > prev.last_purchased_at)) {
+          prev.last_purchased_at = o.placed_at
+        }
+        productMap.set(key, prev)
+      }
+    }
+    const products_purchased = Array.from(productMap.values()).sort(
+      (a, b) => b.total_spent - a.total_spent
+    )
 
     return res.json({
       customer,
@@ -157,6 +211,9 @@ router.get('/:id', async (req, res, next) => {
         lifetime_spend: Number(p.total_spent) || 0,
         favorite_product: p.favorite_product_name,
         first_order_date: p.first_order_date,
+        products_purchased,
+        total_units_purchased: products_purchased.reduce((s, p) => s + p.total_qty, 0),
+        unique_products_purchased: products_purchased.length,
       },
     })
   } catch (err) {

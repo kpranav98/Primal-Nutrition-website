@@ -341,6 +341,31 @@ export async function listOrders({ page = 1, limit = 25, status, customerId, fro
 }
 
 /**
+ * List orders that should have shipped but have no AWB yet — used by the
+ * shipment-reconciliation cron to recover from background shipment failures.
+ *
+ * Matches: not cancelled, no AWB, placed within `days`, and either a paid
+ * online order or a pending COD order (COD stays 'pending' until shipped).
+ *
+ * @param {{ days?: number, limit?: number }} opts
+ */
+export async function listOrdersAwaitingFulfillment({ days = 7, limit = 50 } = {}) {
+  const supabase = requireSupabase()
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString()
+  const { data, error } = await supabase
+    .from('orders')
+    .select('id, order_number, status, payment_method, shiprocket_order_id, awb_code, placed_at')
+    .is('awb_code', null)
+    .is('cancelled_at', null)
+    .gte('placed_at', since)
+    .or('status.eq.paid,and(status.eq.pending,payment_method.eq.cod)')
+    .order('placed_at', { ascending: true })
+    .limit(limit)
+  if (error) throw error
+  return data ?? []
+}
+
+/**
  * Get a single order by ID with full detail.
  *
  * @param {string} id — UUID
